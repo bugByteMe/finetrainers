@@ -7,7 +7,7 @@ from .models.cogview4 import CogView4ControlModelSpecification, CogView4ModelSpe
 from .models.flux import FluxModelSpecification
 from .models.hunyuan_video import HunyuanVideoModelSpecification
 from .models.ltx_video import LTXVideoModelSpecification
-from .models.wan import WanControlModelSpecification, WanModelSpecification
+from .models.wan import WanControlModelSpecification, WanModelSpecification, WanModelSpecificationInv
 
 
 class ModelType(str, Enum):
@@ -23,6 +23,7 @@ class TrainingType(str, Enum):
     # SFT
     LORA = "lora"
     FULL_FINETUNE = "full-finetune"
+    INV = "inv"
 
     # Control
     CONTROL_LORA = "control-lora"
@@ -59,6 +60,7 @@ SUPPORTED_MODEL_CONFIGS = {
         TrainingType.FULL_FINETUNE: WanModelSpecification,
         TrainingType.CONTROL_LORA: WanControlModelSpecification,
         TrainingType.CONTROL_FULL_FINETUNE: WanControlModelSpecification,
+        "inv": WanModelSpecificationInv,
     },
 }
 

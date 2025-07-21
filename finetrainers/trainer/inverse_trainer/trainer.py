@@ -22,258 +22,75 @@ from finetrainers.config import TrainingType
 from finetrainers.state import TrainState
 
 from ..base import Trainer
-from .config import SFTFullRankConfig, SFTLowRankConfig
+from ..sft_trainer.config import SFTFullRankConfig, SFTLowRankConfig
+from ..sft_trainer.trainer import SFTTrainer
 
+from transformers import AutoTokenizer, UMT5EncoderModel
 
 ArgsType = Union[BaseArgsType, SFTFullRankConfig, SFTLowRankConfig]
 
 logger = logging.get_logger()
 
+class EmbeddingWrap(torch.nn.Module):
+    """
+    A simple wrapper for the embedding to be trained.
+    This is used to ensure that the embedding is treated as a single module
+    and can be easily moved to the correct device.
+    """
 
-class SFTTrainer(Trainer):
+    def __init__(self, embedding: torch.nn.Module):
+        super().__init__()
+        self.embedding = torch.nn.Parameter(embedding.clone().detach())
+
+    def forward(self, *args, **kwargs):
+        return self.embedding(*args, **kwargs)
+    
+    
+class InvTrainer(SFTTrainer):
+
     def __init__(self, args: ArgsType, model_specification: models.ModelSpecification) -> None:
-        super().__init__(args)
-
-        # Tokenizers
-        self.tokenizer = None
-        self.tokenizer_2 = None
-        self.tokenizer_3 = None
-
-        # Text encoders
-        self.text_encoder = None
-        self.text_encoder_2 = None
-        self.text_encoder_3 = None
-
-        # Image encoders
-        self.image_encoder = None
-        self.image_processor = None
-
-        # Denoisers
-        self.transformer = None
-        self.unet = None
-
-        # Autoencoders
-        self.vae = None
-
-        # Scheduler
-        self.scheduler = None
-
-        # Optimizer & LR scheduler
-        self.optimizer = None
-        self.lr_scheduler = None
-
-        # Checkpoint manager
-        self.checkpointer = None
-
-        self.model_specification = model_specification
-        self._are_condition_models_loaded = False
+        super().__init__(args, model_specification)
+        self.embedding = None # Special embedding to be trained
         torch.serialization.add_safe_globals([TrainState])
+    # Wrapper for prepare_conditions to handle the specific case of inverse training
+    @torch.no_grad()
+    def prepare_conditions(
+        self,
+        tokenizer: AutoTokenizer,
+        text_encoder: UMT5EncoderModel,
+        caption: str,
+        max_sequence_length: int = 512,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        conditions = {
+            "tokenizer": tokenizer,
+            "text_encoder": text_encoder,
+            "caption": caption,
+            "max_sequence_length": max_sequence_length,
+            **kwargs,
+        }
 
-    def run(self) -> None:
-        try:
-            self._prepare_models()
-            self._prepare_trainable_parameters()
-            self._prepare_for_training()
-            self._prepare_dataset()
-            self._prepare_checkpointing()
-            self._train()
-            # trainer._evaluate()
-        except Exception as e:
-            logger.error(f"Error during training: {e}")
-            self.state.parallel_backend.destroy()
-            raise e
-
-    def _prepare_models(self) -> None:
-        logger.info("Initializing models")
-
-        diffusion_components = self.model_specification.load_diffusion_models()
-        self._set_components(diffusion_components)
-
-        if self.state.parallel_backend.pipeline_parallel_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not supported yet. This will be supported in the future."
-            )
-
-    def _prepare_trainable_parameters(self) -> None:
-        logger.info("Initializing trainable parameters")
-
-        parallel_backend = self.state.parallel_backend
-
-        if self.args.training_type == TrainingType.FULL_FINETUNE:
-            logger.info("Finetuning transformer with no additional parameters")
-            utils.set_requires_grad([self.transformer], True)
-        else:
-            logger.info("Finetuning transformer with PEFT parameters")
-            utils.set_requires_grad([self.transformer], False)
-
-        # Layerwise upcasting must be applied before adding the LoRA adapter.
-        # If we don't perform this before moving to device, we might OOM on the GPU. So, best to do it on
-        # CPU for now, before support is added in Diffusers for loading and enabling layerwise upcasting directly.
-        if self.args.training_type == TrainingType.LORA and "transformer" in self.args.layerwise_upcasting_modules:
-            apply_layerwise_casting(
-                self.transformer,
-                storage_dtype=self.args.layerwise_upcasting_storage_dtype,
-                compute_dtype=self.args.transformer_dtype,
-                skip_modules_pattern=self.args.layerwise_upcasting_skip_modules_pattern,
-                non_blocking=True,
-            )
-
-        transformer_lora_config = None
-        if self.args.training_type == TrainingType.LORA:
-            transformer_lora_config = LoraConfig(
-                r=self.args.rank,
-                lora_alpha=self.args.lora_alpha,
-                init_lora_weights=True,
-                target_modules=self.args.target_modules,
-            )
-            self.transformer.add_adapter(transformer_lora_config)
-
-        # Make sure the trainable params are in float32 if data sharding is not enabled. For FSDP, we need all
-        # parameters to be of the same dtype.
-        if parallel_backend.data_sharding_enabled:
-            self.transformer.to(dtype=self.args.transformer_dtype)
-        else:
-            if self.args.training_type == TrainingType.LORA:
-                cast_training_params([self.transformer], dtype=torch.float32)
-
-    def _prepare_for_training(self) -> None:
-        # 1. Apply parallelism
-        parallel_backend = self.state.parallel_backend
-        model_specification = self.model_specification
-
-        if parallel_backend.context_parallel_enabled:
-            parallel_backend.apply_context_parallel(self.transformer, parallel_backend.get_mesh()["cp"])
-
-        if parallel_backend.tensor_parallel_enabled:
-            # TODO(aryan): handle fp8 from TorchAO here
-            model_specification.apply_tensor_parallel(
-                backend=parallel.ParallelBackendEnum.PTD,
-                device_mesh=parallel_backend.get_mesh()["tp"],
-                transformer=self.transformer,
-            )
-
-        # Enable gradient checkpointing
-        if self.args.gradient_checkpointing:
-            # TODO(aryan): support other checkpointing types
-            utils.apply_activation_checkpointing(self.transformer, checkpointing_type="full")
-
-        # Apply torch.compile
-        self._maybe_torch_compile()
-
-        # Enable DDP, FSDP or HSDP
-        if parallel_backend.data_sharding_enabled:
-            # TODO(aryan): remove this when supported
-            if self.args.parallel_backend == "accelerate":
-                raise NotImplementedError("Data sharding is not supported with Accelerate yet.")
-
-            dp_method = "HSDP" if parallel_backend.data_replication_enabled else "FSDP"
-            logger.info(f"Applying {dp_method} on the model")
-
-            if parallel_backend.data_replication_enabled or parallel_backend.context_parallel_enabled:
-                dp_mesh_names = ("dp_replicate", "dp_shard_cp")
-            else:
-                dp_mesh_names = ("dp_shard_cp",)
-
-            parallel_backend.apply_fsdp2(
-                model=self.transformer,
-                param_dtype=self.args.transformer_dtype,
-                reduce_dtype=torch.float32,
-                output_dtype=None,
-                pp_enabled=parallel_backend.pipeline_parallel_enabled,
-                cpu_offload=False,  # TODO(aryan): needs to be tested and allowed for enabling later
-                device_mesh=parallel_backend.get_mesh()[dp_mesh_names],
-            )
-        elif parallel_backend.data_replication_enabled:
-            if parallel_backend.get_mesh().ndim > 1:
-                raise ValueError("DDP not supported for > 1D parallelism")
-            logger.info("Applying DDP to the model")
-            parallel_backend.apply_ddp(self.transformer, parallel_backend.get_mesh())
-        else:
-            parallel_backend.prepare_model(self.transformer)
-
-        self._move_components_to_device()
-
-        # 2. Prepare optimizer and lr scheduler
-        # For training LoRAs, we can be a little more optimal. Currently, the OptimizerWrapper only accepts torch::nn::Module.
-        # This causes us to loop over all the parameters (even ones that don't require gradients, as in LoRA) at each optimizer
-        # step. This is OK (see https://github.com/pytorch/pytorch/blob/2f40f789dafeaa62c4e4b90dbf4a900ff6da2ca4/torch/optim/sgd.py#L85-L99)
-        # but can be optimized a bit by maybe creating a simple wrapper module encompassing the actual parameters that require
-        # gradients. TODO(aryan): look into it in the future.
-        model_parts = [self.transformer]
-        self.state.num_trainable_parameters = sum(
-            p.numel() for m in model_parts for p in m.parameters() if p.requires_grad
+        temp_tokens = tokenizer(
+            caption,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
         )
-
-        # Setup distributed optimizer and lr scheduler
-        logger.info("Initializing optimizer and lr scheduler")
-        self.state.train_state = TrainState()
-        self.optimizer = optimizer.get_optimizer(
-            parallel_backend=self.args.parallel_backend,
-            name=self.args.optimizer,
-            model_parts=model_parts,
-            learning_rate=self.args.lr,
-            beta1=self.args.beta1,
-            beta2=self.args.beta2,
-            beta3=self.args.beta3,
-            epsilon=self.args.epsilon,
-            weight_decay=self.args.weight_decay,
-            fused=False,
-        )
-        self.lr_scheduler = optimizer.get_lr_scheduler(
-            parallel_backend=self.args.parallel_backend,
-            name=self.args.lr_scheduler,
-            optimizer=self.optimizer,
-            num_warmup_steps=self.args.lr_warmup_steps,
-            num_training_steps=self.args.train_steps,
-            # TODO(aryan): handle last_epoch
-        )
-        self.optimizer, self.lr_scheduler = parallel_backend.prepare_optimizer(self.optimizer, self.lr_scheduler)
-
-        # 3. Initialize trackers, directories and repositories
-        self._init_logging()
-        self._init_trackers()
-        self._init_directories_and_repositories()
-
-    def _prepare_dataset(self) -> None:
-        logger.info("Initializing dataset and dataloader")
-
-        with open(self.args.dataset_config, "r") as file:
-            dataset_configs = json.load(file)["datasets"]
-        logger.info(f"Training configured to use {len(dataset_configs)} datasets")
-
-        datasets = []
-        for config in dataset_configs:
-            data_root = config.pop("data_root", None)
-            dataset_file = config.pop("dataset_file", None)
-            dataset_type = config.pop("dataset_type")
-            caption_options = config.pop("caption_options", {})
-
-            if data_root is not None and dataset_file is not None:
-                raise ValueError("Both data_root and dataset_file cannot be provided in the same dataset config.")
-
-            dataset_name_or_root = data_root or dataset_file
-            dataset = data.initialize_dataset(
-                dataset_name_or_root, dataset_type, streaming=True, infinite=True, _caption_options=caption_options
-            )
-
-            if not dataset._precomputable_once and self.args.precomputation_once:
-                raise ValueError(
-                    f"Dataset {dataset_name_or_root} does not support precomputing all embeddings at once."
-                )
-
-            logger.info(f"Initialized dataset: {dataset_name_or_root}")
-            dataset = self.state.parallel_backend.prepare_dataset(dataset)
-            dataset = data.wrap_iterable_dataset_for_preprocessing(dataset, dataset_type, config)
-            datasets.append(dataset)
-
-        dataset = data.combine_datasets(datasets, buffer_size=self.args.dataset_shuffle_buffer_size, shuffle=True)
-        dataloader = self.state.parallel_backend.prepare_dataloader(
-            dataset, batch_size=1, num_workers=self.args.dataloader_num_workers, pin_memory=self.args.pin_memory
-        )
-
-        self.dataset = dataset
-        self.dataloader = dataloader
-
+        special_mask = temp_tokens.input_ids[0] == 900
+        # Add batch dimension
+        special_mask = special_mask.unsqueeze(0).to(dtype=torch.bool)
+        logger.info(f"{temp_tokens.input_ids.shape}, {special_mask.shape} {special_mask.to(dtype=torch.bfloat16).sum()}")
+        # logger.info(f"Special indices: {self.special_indices}, tokens: {temp_tokens.input_ids[0]}")
+        conditions = self.model_specification.prepare_conditions(**conditions)
+        conditions['special_mask'] = special_mask
+        # logger.info(f"shape: {conditions['encoder_hidden_states'].shape}, dtype: {conditions['encoder_hidden_states'].dtype}")
+        # conditions['encoder_hidden_states'][:, self.special_indices, :] = self.embedding.embedding
+        # logger.info(f"Updated conditions with embedding: {conditions['encoder_hidden_states'].shape}")
+        # logger.info(f"{self.embedding.embedding.requires_grad}, {conditions['encoder_hidden_states'].requires_grad}")
+        return conditions
+    
     def _prepare_checkpointing(self) -> None:
         parallel_backend = self.state.parallel_backend
 
@@ -309,7 +126,7 @@ class SFTTrainer(Trainer):
         enable_state_checkpointing = self.args.checkpointing_steps > 0
         self.checkpointer = parallel_backend.get_checkpointer(
             dataloader=self.dataloader,
-            model_parts=[self.transformer],
+            model_parts=[self.embedding],
             optimizers=self.optimizer,
             schedulers=self.lr_scheduler,
             states={"train_state": self.state.train_state},
@@ -325,6 +142,168 @@ class SFTTrainer(Trainer):
             resume_from_checkpoint = -1
         if resume_from_checkpoint is not None:
             self.checkpointer.load(resume_from_checkpoint)
+        
+        self.state.train_state = self.checkpointer.states['train_state'] # TODO??
+        self.checkpointer.save(
+            step=0, _device=self.state.parallel_backend.device, _is_main_process=parallel_backend.is_main_process
+        )
+        # exit(0)
+
+    def _prepare_trainable_parameters(self) -> None:
+        logger.info("Initializing trainable parameters")
+
+        parallel_backend = self.state.parallel_backend
+
+        # Load tokenizers and text encoders
+        condition_components = self.model_specification.load_condition_models()
+        component_names = list(condition_components.keys())
+        component_modules = list(condition_components.values())
+        logger.info(f"Loaded condition components: {component_names}")
+        self._set_components(condition_components)
+        self._move_components_to_device(component_modules)
+        self._maybe_torch_compile()
+        
+        # Load potential checkpoints
+        # items = os.listdir(self.args.output_dir)
+        # items = [item for item in items if item.endswith(".pt")]
+        # items.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
+        # logger.info(f"Found {len(items)} potential checkpoints in {self.args.output_dir}")
+        # if items:
+        #     latest_checkpoint = items[-1]
+        #     logger.info(f"Loading latest checkpoint: {latest_checkpoint}")
+        #     checkpoint_path = os.path.join(self.args.output_dir, latest_checkpoint)
+        #     self.embedding = torch.load(checkpoint_path, map_location=parallel_backend.device)
+        # else:
+        embedding = self.model_specification.prepare_conditions(self.tokenizer, self.text_encoder, "car")['encoder_hidden_states'][:, :1, :]
+        
+        logger.info(f"Embedding shape: {embedding.shape}")
+        logger.info("Finetuning textual embedding parameters")
+        self.embedding = EmbeddingWrap(embedding)
+
+        utils.set_requires_grad([self.transformer], False)
+        utils.set_requires_grad([self.embedding], True)
+        logger.info(f"embedding requires_grad: {self.embedding.requires_grad_}, {self.embedding.embedding.requires_grad}")
+        self._delete_components(component_names)
+        del condition_components, component_names, component_modules
+
+        assert self.args.training_type == "inv"
+
+        # Make sure the trainable params are in float32 if data sharding is not enabled. For FSDP, we need all
+        # parameters to be of the same dtype.
+        if parallel_backend.data_sharding_enabled:
+            self.transformer.to(dtype=self.args.transformer_dtype)
+    
+    # Modify trainable parameters to include the embedding
+    def _prepare_for_training(self) -> None:
+        # 1. Apply parallelism
+        parallel_backend = self.state.parallel_backend
+        model_specification = self.model_specification
+
+        if parallel_backend.context_parallel_enabled:
+            parallel_backend.apply_context_parallel(self.transformer, parallel_backend.get_mesh()["cp"])
+            parallel_backend.apply_context_parallel(self.embedding, parallel_backend.get_mesh()["cp"])
+
+        if parallel_backend.tensor_parallel_enabled:
+            # TODO(aryan): handle fp8 from TorchAO here
+            model_specification.apply_tensor_parallel(
+                backend=parallel.ParallelBackendEnum.PTD,
+                device_mesh=parallel_backend.get_mesh()["tp"],
+                transformer=self.transformer,
+            )
+
+        # Enable gradient checkpointing
+        if self.args.gradient_checkpointing:
+            # TODO(aryan): support other checkpointing types
+            utils.apply_activation_checkpointing(self.transformer, checkpointing_type="full")
+            utils.apply_activation_checkpointing(self.embedding, checkpointing_type="full")
+
+        # Apply torch.compile
+        self._maybe_torch_compile()
+
+        # Enable DDP, FSDP or HSDP
+        if parallel_backend.data_sharding_enabled:
+            # TODO(aryan): remove this when supported
+            if self.args.parallel_backend == "accelerate":
+                raise NotImplementedError("Data sharding is not supported with Accelerate yet.")
+
+            dp_method = "HSDP" if parallel_backend.data_replication_enabled else "FSDP"
+            logger.info(f"Applying {dp_method} on the model")
+
+            if parallel_backend.data_replication_enabled or parallel_backend.context_parallel_enabled:
+                dp_mesh_names = ("dp_replicate", "dp_shard_cp")
+            else:
+                dp_mesh_names = ("dp_shard_cp",)
+
+            parallel_backend.apply_fsdp2(
+                model=self.transformer,
+                param_dtype=self.args.transformer_dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                pp_enabled=parallel_backend.pipeline_parallel_enabled,
+                cpu_offload=False,  # TODO(aryan): needs to be tested and allowed for enabling later
+                device_mesh=parallel_backend.get_mesh()[dp_mesh_names],
+            )
+        elif parallel_backend.data_replication_enabled:
+            if parallel_backend.get_mesh().ndim > 1:
+                raise ValueError("DDP not supported for > 1D parallelism")
+            logger.info("Applying DDP to the model")
+            parallel_backend.apply_ddp(self.transformer, parallel_backend.get_mesh())
+        else:
+            # parallel_backend.prepare_model(self.transformer)
+            parallel_backend.prepare_model(self.embedding)
+            logger.info(f"Prepare Model!!!")
+
+        self._move_components_to_device()
+
+        # 2. Prepare optimizer and lr scheduler
+        # For training LoRAs, we can be a little more optimal. Currently, the OptimizerWrapper only accepts torch::nn::Module.
+        # This causes us to loop over all the parameters (even ones that don't require gradients, as in LoRA) at each optimizer
+        # step. This is OK (see https://github.com/pytorch/pytorch/blob/2f40f789dafeaa62c4e4b90dbf4a900ff6da2ca4/torch/optim/sgd.py#L85-L99)
+        # but can be optimized a bit by maybe creating a simple wrapper module encompassing the actual parameters that require
+        # gradients. TODO(aryan): look into it in the future.
+        model_parts = [self.embedding]
+        self.state.num_trainable_parameters = sum(
+            p.numel() for m in model_parts for p in m.parameters() if p.requires_grad
+        )
+
+        # Setup distributed optimizer and lr scheduler
+        logger.info("Initializing optimizer and lr scheduler")
+        self.state.train_state = TrainState()
+        self.optimizer = optimizer.get_optimizer(
+            parallel_backend=self.args.parallel_backend,
+            name=self.args.optimizer,
+            model_parts=model_parts,
+            learning_rate=self.args.lr,
+            beta1=self.args.beta1,
+            beta2=self.args.beta2,
+            beta3=self.args.beta3,
+            epsilon=self.args.epsilon,
+            weight_decay=self.args.weight_decay,
+            fused=False,
+        )
+        self.lr_scheduler = optimizer.get_lr_scheduler(
+            parallel_backend=self.args.parallel_backend,
+            name=self.args.lr_scheduler,
+            optimizer=self.optimizer,
+            num_warmup_steps=self.args.lr_warmup_steps,
+            num_training_steps=self.args.train_steps,
+            # TODO(aryan): handle last_epoch
+        )
+        self.optimizer, self.lr_scheduler = parallel_backend.prepare_optimizer(self.optimizer, self.lr_scheduler)
+
+        # 3. Initialize trackers, directories and repositories
+        self._init_logging()
+        self._init_trackers()
+        self._init_directories_and_repositories()
+
+    def _save_embedding(self, step: int) -> None:
+        """
+        Save the embedding to the output directory.
+        This is used to save the embedding at regular intervals during training.
+        """
+        embedding_path = os.path.join(self.args.output_dir, f"embedding_step_{step}.pt")
+        torch.save(self.embedding.state_dict(), embedding_path)
+        logger.info(f"Saved embedding to {embedding_path}")
 
     def _train(self) -> None:
         logger.info("Starting training")
@@ -369,7 +348,7 @@ class SFTTrainer(Trainer):
         )
         # timesteps_buffer = []
 
-        self.transformer.train()
+        # self.transformer.train()
         data_iterator = iter(self.dataloader)
 
         compute_posterior = False if self.args.enable_precomputation else (not self.args.precomputation_once)
@@ -378,7 +357,7 @@ class SFTTrainer(Trainer):
             world_size=parallel_backend.world_size,
             num_items=self.args.precomputation_items if self.args.enable_precomputation else 1,
             processor_fn={
-                "condition": self.model_specification.prepare_conditions,
+                "condition": self.prepare_conditions,
                 "latent": functools.partial(
                     self.model_specification.prepare_latents, compute_posterior=compute_posterior
                 ),
@@ -432,7 +411,14 @@ class SFTTrainer(Trainer):
             condition_model_conditions = utils.align_device_and_dtype(condition_model_conditions, device, dtype)
             latent_model_conditions = utils.make_contiguous(latent_model_conditions)
             condition_model_conditions = utils.make_contiguous(condition_model_conditions)
-
+            logger.info(condition_model_conditions.keys())
+            # logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
+            # convert mask from float to bool
+            condition_model_conditions['special_mask'] = condition_model_conditions['special_mask'].to(torch.bool)
+            # logger.info(f"mask dtype: {condition_model_conditions['special_mask']}, shape: {condition_model_conditions['special_mask'].shape}")
+            condition_model_conditions['encoder_hidden_states'][condition_model_conditions['special_mask'], :] = self.embedding.embedding
+            logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
+            condition_model_conditions.pop("special_mask", None)
             # 3. Forward pass
             sigmas = utils.prepare_sigmas(
                 scheduler=self.scheduler,
@@ -479,13 +465,14 @@ class SFTTrainer(Trainer):
                     loss = loss.mean()
                     if self.args.gradient_accumulation_steps > 1:
                         loss = loss / self.args.gradient_accumulation_steps
+                    logger.info(f"loss requires_grad: {loss.requires_grad}, loss: {loss.item()}")
                     loss.backward()
-
+                    logger.info(f"Embedding grad norm: {self.embedding.embedding.grad.norm()}")
                 accumulated_loss += loss.detach().item()
                 requires_gradient_step = True
 
             # 5. Clip gradients
-            model_parts = [self.transformer]
+            model_parts = [self.embedding]
             grad_norm = utils.torch._clip_grad_norm_while_handling_failing_dtensor_cases(
                 [p for m in model_parts for p in m.parameters()],
                 self.args.max_grad_norm,
@@ -495,14 +482,19 @@ class SFTTrainer(Trainer):
 
             # 6. Step optimizer & log metrics
             logs = {}
-
+            # if train_state.step % 60 == 0:
+            #     self._save_embedding(train_state.step)
+            
             if train_state.step % self.args.gradient_accumulation_steps == 0:
                 # TODO(aryan): revisit no_sync() for FSDP
+                initial_embedding = self.embedding.embedding.clone().detach()
                 with self.tracker.timed("timing/optimizer_step"):
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
-
+                logger.info(f"embedding: {self.embedding.embedding.sum()}")
+                logger.info(f"embedding change: {(initial_embedding - self.embedding.embedding).norm()}")
+                logs["train/lr"] = self.lr_scheduler.get_last_lr()[0] if isinstance(self.lr_scheduler, dict) else self.lr_scheduler.get_last_lr()
                 if grad_norm is not None:
                     grad_norm = grad_norm if isinstance(grad_norm, float) else grad_norm.detach().item()
                 if (
@@ -550,15 +542,20 @@ class SFTTrainer(Trainer):
                 parallel_backend.log(logs, step=train_state.step)
                 train_state.log_steps.append(train_state.step)
 
-            # 7. Save checkpoint if required
+            # 7. Save checkpoint if required # TODO
             with self.tracker.timed("timing/checkpoint"):
-                self.checkpointer.save(
-                    step=train_state.step, _device=device, _is_main_process=parallel_backend.is_main_process
-                )
+                if train_state.step % 1000 == 0:
+                    self.checkpointer.save(
+                        step=train_state.step, _device=device, _is_main_process=parallel_backend.is_main_process
+                    )
+                    self._save_embedding(train_state.step)
 
-            # 8. Perform validation if required
-            if train_state.step % self.args.validation_steps == 0:
+            if train_state.step == 4000:
                 self._validate(step=train_state.step, final_validation=False)
+                exit(0)
+            # 8. Perform validation if required # TODO
+            # if train_state.step % self.args.validation_steps == 0:
+            #     self._validate(step=train_state.step, final_validation=False)
 
         # 9. Final checkpoint, validation & cleanup
         self.checkpointer.save(
@@ -580,7 +577,7 @@ class SFTTrainer(Trainer):
             )
 
         parallel_backend.destroy()
-
+    
     def _validate(self, step: int, final_validation: bool = False) -> None:
         if self.args.validation_dataset_file is None:
             return
@@ -622,7 +619,9 @@ class SFTTrainer(Trainer):
         # TODO(aryan): when running validation with FSDP, if the number of data points is not divisible by dp_shards, we
         # will hang indefinitely. Either pad the dataset or raise an error early on during initialization if the dataset
         # size is not divisible by dp_shards.
-        self.transformer.eval()
+        # self.transformer.eval()
+        self.embedding.eval()
+        self.embedding.requires_grad_(False)
         while True:
             validation_data = next(data_iterator, None)
             if validation_data is None:
@@ -631,7 +630,7 @@ class SFTTrainer(Trainer):
             validation_data = validation_data[0]
             with self.attention_provider_ctx(training=False):
                 validation_artifacts = self.model_specification.validation(
-                    pipeline=pipeline, generator=generator, **validation_data
+                    pipeline=pipeline, generator=generator, special_embedding=self.embedding.embedding.clone().detach(), **validation_data
                 )
 
             if dp_local_rank != 0:
@@ -722,226 +721,5 @@ class SFTTrainer(Trainer):
         parallel_backend.wait_for_everyone()
         if not final_validation:
             self._move_components_to_device()
-            self.transformer.train()
-
-    def _evaluate(self) -> None:
-        raise NotImplementedError("Evaluation has not been implemented yet.")
-
-    def _init_directories_and_repositories(self) -> None:
-        if self.state.parallel_backend.is_main_process:
-            self.args.output_dir = Path(self.args.output_dir)
-            self.args.output_dir.mkdir(parents=True, exist_ok=True)
-            self.state.output_dir = Path(self.args.output_dir)
-
-            if self.args.push_to_hub:
-                repo_id = self.args.hub_model_id or Path(self.args.output_dir).name
-                self.state.repo_id = create_repo(token=self.args.hub_token, repo_id=repo_id, exist_ok=True).repo_id
-
-    def _move_components_to_device(
-        self, components: Optional[List[torch.nn.Module]] = None, device: Optional[Union[str, torch.device]] = None
-    ) -> None:
-        if device is None:
-            device = self.state.parallel_backend.device
-        if components is None:
-            components = [
-                self.text_encoder,
-                self.text_encoder_2,
-                self.text_encoder_3,
-                self.image_encoder,
-                self.transformer,
-                self.vae,
-            ]
-        components = utils.get_non_null_items(components)
-        components = list(filter(lambda x: hasattr(x, "to"), components))
-        for component in components:
-            component.to(device)
-
-    def _set_components(self, components: Dict[str, Any]) -> None:
-        for component_name in self._all_component_names:
-            existing_component = getattr(self, component_name, None)
-            new_component = components.get(component_name, existing_component)
-            setattr(self, component_name, new_component)
-
-    def _delete_components(self, component_names: Optional[List[str]] = None) -> None:
-        if component_names is None:
-            component_names = self._all_component_names
-        for component_name in component_names:
-            setattr(self, component_name, None)
-        utils.free_memory()
-        utils.synchronize_device()
-
-    def _init_pipeline(self, final_validation: bool = False) -> DiffusionPipeline:
-        module_names = ["text_encoder", "text_encoder_2", "text_encoder_3", "image_encoder", "transformer", "vae"]
-
-        if not final_validation:
-            module_names.remove("transformer")
-            pipeline = self.model_specification.load_pipeline(
-                tokenizer=self.tokenizer,
-                tokenizer_2=self.tokenizer_2,
-                tokenizer_3=self.tokenizer_3,
-                text_encoder=self.text_encoder,
-                text_encoder_2=self.text_encoder_2,
-                text_encoder_3=self.text_encoder_3,
-                image_encoder=self.image_encoder,
-                image_processor=self.image_processor,
-                # TODO(aryan): handle unwrapping for compiled modules
-                # transformer=utils.unwrap_model(accelerator, self.transformer),
-                transformer=self.transformer,
-                vae=self.vae,
-                enable_slicing=self.args.enable_slicing,
-                enable_tiling=self.args.enable_tiling,
-                enable_model_cpu_offload=self.args.enable_model_cpu_offload,
-                training=True,
-            )
-        else:
-            self._delete_components()
-
-            # Load the transformer weights from the final checkpoint if performing full-finetune
-            transformer = None
-            if self.args.training_type == TrainingType.FULL_FINETUNE:
-                transformer = self.model_specification.load_diffusion_models()["transformer"]
-
-            pipeline = self.model_specification.load_pipeline(
-                transformer=transformer,
-                enable_slicing=self.args.enable_slicing,
-                enable_tiling=self.args.enable_tiling,
-                enable_model_cpu_offload=self.args.enable_model_cpu_offload,
-                training=False,
-            )
-
-            # Load the LoRA weights if performing LoRA finetuning
-            if self.args.training_type == TrainingType.LORA:
-                pipeline.load_lora_weights(
-                    os.path.join(self.args.output_dir, "lora_weights", f"{self.state.train_state.step:06d}")
-                )
-
-        components = {module_name: getattr(pipeline, module_name, None) for module_name in module_names}
-        self._set_components(components)
-        if not self.args.enable_model_cpu_offload:
-            self._move_components_to_device(list(components.values()))
-        self._maybe_torch_compile()
-        return pipeline
-
-    def _prepare_data(
-        self,
-        preprocessor: Union[data.InMemoryDistributedDataPreprocessor, data.PrecomputedDistributedDataPreprocessor],
-        data_iterator,
-    ):
-        if not self.args.enable_precomputation:
-            if not self._are_condition_models_loaded:
-                logger.info(
-                    "Precomputation disabled. Loading in-memory data loaders. All components will be loaded on GPUs."
-                )
-                condition_components = self.model_specification.load_condition_models()
-                latent_components = self.model_specification.load_latent_models()
-                all_components = {**condition_components, **latent_components}
-                self._set_components(all_components)
-                self._move_components_to_device(list(all_components.values()))
-                utils._enable_vae_memory_optimizations(self.vae, self.args.enable_slicing, self.args.enable_tiling)
-                self._maybe_torch_compile()
-            else:
-                condition_components = {k: v for k in self._condition_component_names if (v := getattr(self, k, None))}
-                latent_components = {k: v for k in self._latent_component_names if (v := getattr(self, k, None))}
-
-            condition_iterator = preprocessor.consume(
-                "condition",
-                components=condition_components,
-                data_iterator=data_iterator,
-                generator=self.state.generator,
-                cache_samples=True,
-            )
-            latent_iterator = preprocessor.consume(
-                "latent",
-                components=latent_components,
-                data_iterator=data_iterator,
-                generator=self.state.generator,
-                use_cached_samples=True,
-                drop_samples=True,
-            )
-
-            self._are_condition_models_loaded = True
-        else:
-            logger.info("Precomputed condition & latent data exhausted. Loading & preprocessing new data.")
-
-            parallel_backend = self.state.parallel_backend
-            if parallel_backend.world_size == 1:
-                self._move_components_to_device([self.transformer], "cpu")
-                utils.free_memory()
-                utils.synchronize_device()
-                torch.cuda.reset_peak_memory_stats(parallel_backend.device)
-
-            consume_fn = preprocessor.consume_once if self.args.precomputation_once else preprocessor.consume
-
-            # Prepare condition iterators
-            condition_components, component_names, component_modules = {}, [], []
-            if not self.args.precomputation_reuse:
-                condition_components = self.model_specification.load_condition_models()
-                component_names = list(condition_components.keys())
-                component_modules = list(condition_components.values())
-                self._set_components(condition_components)
-                self._move_components_to_device(component_modules)
-                self._maybe_torch_compile()
-            condition_iterator = consume_fn(
-                "condition",
-                components=condition_components,
-                data_iterator=data_iterator,
-                generator=self.state.generator,
-                cache_samples=True,
-            )
-            self._delete_components(component_names)
-            del condition_components, component_names, component_modules
-
-            # Prepare latent iterators
-            latent_components, component_names, component_modules = {}, [], []
-            if not self.args.precomputation_reuse:
-                latent_components = self.model_specification.load_latent_models()
-                utils._enable_vae_memory_optimizations(self.vae, self.args.enable_slicing, self.args.enable_tiling)
-                component_names = list(latent_components.keys())
-                component_modules = list(latent_components.values())
-                self._set_components(latent_components)
-                self._move_components_to_device(component_modules)
-                self._maybe_torch_compile()
-            latent_iterator = consume_fn(
-                "latent",
-                components=latent_components,
-                data_iterator=data_iterator,
-                generator=self.state.generator,
-                use_cached_samples=True,
-                drop_samples=True,
-            )
-            self._delete_components(component_names)
-            del latent_components, component_names, component_modules
-
-            if parallel_backend.world_size == 1:
-                self._move_components_to_device([self.transformer])
-
-        return condition_iterator, latent_iterator
-
-    def _maybe_torch_compile(self):
-        for model_name, compile_scope in zip(self.args.compile_modules, self.args.compile_scopes):
-            model = getattr(self, model_name, None)
-            if model is not None:
-                logger.info(f"Applying torch.compile to '{model_name}' with scope '{compile_scope}'.")
-                compiled_model = utils.apply_compile(model, compile_scope)
-                setattr(self, model_name, compiled_model)
-
-    def _get_training_info(self) -> Dict[str, Any]:
-        info = self.args.to_dict()
-
-        # Removing flow matching arguments when not using flow-matching objective
-        diffusion_args = info.get("diffusion_arguments", {})
-        scheduler_name = self.scheduler.__class__.__name__ if self.scheduler is not None else ""
-        if scheduler_name != "FlowMatchEulerDiscreteScheduler":
-            filtered_diffusion_args = {k: v for k, v in diffusion_args.items() if "flow" not in k}
-        else:
-            filtered_diffusion_args = diffusion_args
-
-        info.update({"diffusion_arguments": filtered_diffusion_args})
-        return info
-
-    # fmt: off
-    _all_component_names = ["tokenizer", "tokenizer_2", "tokenizer_3", "text_encoder", "text_encoder_2", "text_encoder_3", "image_encoder", "image_processor", "transformer", "unet", "vae", "scheduler"]
-    _condition_component_names = ["tokenizer", "tokenizer_2", "tokenizer_3", "text_encoder", "text_encoder_2", "text_encoder_3"]
-    _latent_component_names = ["image_encoder", "image_processor", "vae"]
-    _diffusion_component_names = ["transformer", "unet", "scheduler"]
-    # fmt: on
+            self.embedding.requires_grad_(True)
+            self.embedding.train()

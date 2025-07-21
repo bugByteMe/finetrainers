@@ -1,7 +1,7 @@
 import sys
 import traceback
 
-from finetrainers import BaseArgs, ControlTrainer, SFTTrainer, TrainingType, get_logger
+from finetrainers import BaseArgs, ControlTrainer, SFTTrainer, InvTrainer, TrainingType, get_logger
 from finetrainers.config import _get_model_specifiction_cls
 from finetrainers.trainer.control_trainer.config import ControlFullRankConfig, ControlLowRankConfig
 from finetrainers.trainer.sft_trainer.config import SFTFullRankConfig, SFTLowRankConfig
@@ -34,7 +34,7 @@ def main():
         training_cls = None
         if training_type == TrainingType.LORA:
             training_cls = SFTLowRankConfig
-        elif training_type == TrainingType.FULL_FINETUNE:
+        elif training_type == TrainingType.FULL_FINETUNE or training_type == "inv":
             training_cls = SFTFullRankConfig
         elif training_type == TrainingType.CONTROL_LORA:
             training_cls = ControlLowRankConfig
@@ -70,6 +70,8 @@ def main():
             trainer = SFTTrainer(args, model_specification)
         elif args.training_type in [TrainingType.CONTROL_LORA, TrainingType.CONTROL_FULL_FINETUNE]:
             trainer = ControlTrainer(args, model_specification)
+        elif args.training_type in [TrainingType.INV]:
+            trainer = InvTrainer(args, model_specification)
         else:
             raise ValueError(f"Training type {args.training_type} not supported.")
 
