@@ -282,8 +282,8 @@ class AccelerateCheckpointer(BaseCheckpointer):
 
             # TODO(aryan): this is a temporary assertion since we only support training transformer at the moment.
             # Remove it when adding support for training text encoders/vae and more.
-            assert len(models) == 1
-
+            # assert len(models) == 1
+            logger.info(f"Models to save: {models}")
             _callback_fn(weights[0])
             torch.save(self.states, os.path.join(output_dir, "states.pt"))
 

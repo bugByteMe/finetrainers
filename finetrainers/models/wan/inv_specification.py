@@ -106,7 +106,16 @@ class WanPipelineInv(WanPipeline):
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         if special_embedding is not None:
             special_embedding = special_embedding.to(device, dtype=dtype)
-            prompt_embeds[:, special_mask, :] = special_embedding
+            for B in range(prompt_embeds.shape[0]):
+                for L in range(prompt_embeds.shape[1]):
+                    if special_mask[L]:
+                        # logger.info(f"Replacing embedding for batch {B}, token {L}")
+                        prompt_embeds[B] = \
+                            torch.cat([prompt_embeds[B, :L, :], 
+                                      special_embedding[0, :],
+                                      prompt_embeds[B, L + 1:, :]], dim=0)[:max_sequence_length]
+                        
+            # prompt_embeds[:, special_mask, :] = special_embedding
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
             [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
@@ -226,6 +235,7 @@ class WanPipelineInv(WanPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        dump_attention_maps: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -369,6 +379,14 @@ class WanPipelineInv(WanPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # 6.1 Prepare for attention maps if requested
+        storage = None
+        if dump_attention_maps:
+            from attn_hook import WanAttnProcessor2_0_Hook
+            from diffusers.models.transformers.transformer_wan import WanAttnProcessor2_0
+            storage = self.transformer.blocks[39].attn2.processor.map_storage
+            self.transformer.blocks[39].attn2.processor = WanAttnProcessor2_0()
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -377,6 +395,9 @@ class WanPipelineInv(WanPipeline):
                 self._current_timestep = t
                 latent_model_input = latents.to(transformer_dtype)
                 timestep = t.expand(latents.shape[0])
+
+                if dump_attention_maps and i == (num_inference_steps - 1):
+                    self.transformer.blocks[39].attn2.processor = WanAttnProcessor2_0_Hook(storage)
 
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
@@ -387,6 +408,8 @@ class WanPipelineInv(WanPipeline):
                 )[0]
 
                 if self.do_classifier_free_guidance:
+                    if dump_attention_maps:
+                        self.transformer.blocks[39].attn2.processor = WanAttnProcessor2_0()
                     noise_uncond = self.transformer(
                         hidden_states=latent_model_input,
                         timestep=timestep,

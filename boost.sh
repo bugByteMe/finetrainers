@@ -1,6 +1,6 @@
 #!/bin/bash
 
-ROOT=./demo2/data3
+ROOT=./demo2/data_sled
 NUM_COPY=1
 # For each video with prefix split_video_part_ under the directory $ROOT:
 # Make a copy of the file

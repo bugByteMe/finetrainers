@@ -355,14 +355,14 @@ class WanModelSpecification(ModelSpecification):
         }
         components = get_non_null_items(components)
 
-        if self.transformer_config.get("image_dim", None) is not None:
-            pipe = WanPipeline.from_pretrained(
-                self.pretrained_model_name_or_path, **components, revision=self.revision, cache_dir=self.cache_dir
-            )
-        else:
-            pipe = WanImageToVideoPipeline.from_pretrained(
-                self.pretrained_model_name_or_path, **components, revision=self.revision, cache_dir=self.cache_dir
-            )
+        # if self.transformer_config.get("image_dim", None) is not None:
+        pipe = WanPipeline.from_pretrained(
+            self.pretrained_model_name_or_path, **components, revision=self.revision, cache_dir=self.cache_dir
+        )
+        # else:
+        #     pipe = WanImageToVideoPipeline.from_pretrained(
+        #         self.pretrained_model_name_or_path, **components, revision=self.revision, cache_dir=self.cache_dir
+        #     )
         pipe.text_encoder.to(self.text_encoder_dtype)
         pipe.vae.to(self.vae_dtype)
 

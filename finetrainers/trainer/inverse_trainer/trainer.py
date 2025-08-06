@@ -39,19 +39,42 @@ class EmbeddingWrap(torch.nn.Module):
     """
 
     def __init__(self, embedding: torch.nn.Module):
+        # embedding: [B, L, Dim]
         super().__init__()
-        self.embedding = torch.nn.Parameter(embedding.clone().detach())
+        self.scale = 1 # Scale the embedding's L dimension
+        self.embedding = torch.nn.Parameter(embedding.clone().detach().repeat(1, self.scale, 1))
+        self.init_embedding = embedding.clone().detach().repeat(1, self.scale, 1)
+        self.init_embedding.requires_grad = False
+        logger.info(f"Scale: {self.scale}, EmbeddingWrap scaled to shape: {self.embedding.shape}, requires_grad: {self.embedding.requires_grad}")
 
     def forward(self, *args, **kwargs):
         return self.embedding(*args, **kwargs)
     
-    
+    def loss(self) -> torch.Tensor:
+        # Difference regularization loss
+        return torch.norm(self.embedding - self.init_embedding.clone().detach(), p=2)
+
 class InvTrainer(SFTTrainer):
 
     def __init__(self, args: ArgsType, model_specification: models.ModelSpecification) -> None:
         super().__init__(args, model_specification)
         self.embedding = None # Special embedding to be trained
+        self.unwrap_transformer = None
+        self.args.joint = True
+        logger.info(f"Joint training: {self.args.joint}")
         torch.serialization.add_safe_globals([TrainState])
+    
+    def _prepare_models(self) -> None:
+        logger.info("Initializing models")
+
+        diffusion_components = self.model_specification.load_diffusion_models()
+        self._set_components(diffusion_components)
+        self.unwrap_transformer = self.transformer
+        if self.state.parallel_backend.pipeline_parallel_enabled:
+            raise NotImplementedError(
+                "Pipeline parallelism is not supported yet. This will be supported in the future."
+            )
+        
     # Wrapper for prepare_conditions to handle the specific case of inverse training
     @torch.no_grad()
     def prepare_conditions(
@@ -97,7 +120,7 @@ class InvTrainer(SFTTrainer):
         def save_model_hook(state_dict: Dict[str, Any]) -> None:
             state_dict = utils.get_unwrapped_model_state_dict(state_dict)
             if parallel_backend.is_main_process:
-                if self.args.training_type == TrainingType.LORA:
+                if self.args.joint:
                     state_dict = get_peft_model_state_dict(self.transformer, state_dict)
                     # fmt: off
                     metadata = {
@@ -126,7 +149,7 @@ class InvTrainer(SFTTrainer):
         enable_state_checkpointing = self.args.checkpointing_steps > 0
         self.checkpointer = parallel_backend.get_checkpointer(
             dataloader=self.dataloader,
-            model_parts=[self.embedding],
+            model_parts=[self.embedding] if not self.args.joint else [self.embedding, self.transformer],
             optimizers=self.optimizer,
             schedulers=self.lr_scheduler,
             states={"train_state": self.state.train_state},
@@ -144,9 +167,38 @@ class InvTrainer(SFTTrainer):
             self.checkpointer.load(resume_from_checkpoint)
         
         self.state.train_state = self.checkpointer.states['train_state'] # TODO??
-        self.checkpointer.save(
-            step=0, _device=self.state.parallel_backend.device, _is_main_process=parallel_backend.is_main_process
-        )
+
+        # Load LoRA weights, only for DB and IV post training
+        # from diffusers import WanPipeline
+        # from diffusers.loaders import WanLoraLoaderMixin
+        # lora_cls = WanLoraLoaderMixin()
+        # kwargs = {}
+        # kwargs["return_lora_metadata"] = True
+        # state_dict, metadata = lora_cls.lora_state_dict("/home/jrguo/finetrainers/demo2/output_lora_sled-dog-2000/lora_weights/002000", **kwargs)
+        # logger.info(f"Model dict: {list(self.unwrap_transformer.named_modules())}")
+        # logger.info(f"State dict: {list(state_dict.keys())}")
+        # lora_cls.load_lora_into_transformer(
+        #     state_dict,
+        #     transformer=self.unwrap_transformer,
+        #     adapter_name="wan-lora",
+        #     metadata=metadata,
+        #     _pipeline=None,
+        #     low_cpu_mem_usage=False,
+        #     hotswap=False,
+        # )
+        if self.args.gradient_checkpointing:
+            # TODO(aryan): support other checkpointing types
+            utils.apply_activation_checkpointing(self.transformer, checkpointing_type="full")
+        
+        # print(self.unwrap_transformer.state_dict().keys())
+        # self.unwrap_transformer.load_lora_weights("/home/jrguo/finetrainers/demo2/output_lora_sled-dog-2000/lora_weights/002000", adapter_name="wan-lora")
+        # self.unwrap_transformer.set_adapters(["wan-lora"], [1.0])
+        # pipeline_cls = WanPipeline(self.tokenizer, self.text_encoder, self.unwrap_transformer, self.vae, self.scheduler)
+        # pipeline_cls.load_lora_weights("/home/jrguo/finetrainers/demo2/output_lora_sled-dog-2000/lora_weights/002000", adapter_name="wan-lora")
+        # pipeline_cls.set_adapters(["wan-lora"], [1.0])
+        # self.checkpointer.save(
+        #     step=0, _device=self.state.parallel_backend.device, _is_main_process=parallel_backend.is_main_process
+        # )
         # exit(0)
 
     def _prepare_trainable_parameters(self) -> None:
@@ -174,7 +226,7 @@ class InvTrainer(SFTTrainer):
         #     checkpoint_path = os.path.join(self.args.output_dir, latest_checkpoint)
         #     self.embedding = torch.load(checkpoint_path, map_location=parallel_backend.device)
         # else:
-        embedding = self.model_specification.prepare_conditions(self.tokenizer, self.text_encoder, "car")['encoder_hidden_states'][:, :1, :]
+        embedding = self.model_specification.prepare_conditions(self.tokenizer, self.text_encoder, os.environ["INIT_TOKEN"])['encoder_hidden_states'][:, :1, :]
         
         logger.info(f"Embedding shape: {embedding.shape}")
         logger.info("Finetuning textual embedding parameters")
@@ -188,10 +240,22 @@ class InvTrainer(SFTTrainer):
 
         assert self.args.training_type == "inv"
 
+        if self.args.joint:
+            transformer_lora_config = None
+            transformer_lora_config = LoraConfig(
+                r=self.args.rank,
+                lora_alpha=self.args.lora_alpha,
+                init_lora_weights=True,
+                target_modules=self.args.target_modules,
+            )
+            self.transformer.add_adapter(transformer_lora_config)
         # Make sure the trainable params are in float32 if data sharding is not enabled. For FSDP, we need all
         # parameters to be of the same dtype.
         if parallel_backend.data_sharding_enabled:
             self.transformer.to(dtype=self.args.transformer_dtype)
+        else:
+            if self.args.joint:
+                cast_training_params([self.transformer], dtype=torch.float32)
     
     # Modify trainable parameters to include the embedding
     def _prepare_for_training(self) -> None:
@@ -214,7 +278,8 @@ class InvTrainer(SFTTrainer):
         # Enable gradient checkpointing
         if self.args.gradient_checkpointing:
             # TODO(aryan): support other checkpointing types
-            utils.apply_activation_checkpointing(self.transformer, checkpointing_type="full")
+            # Dealyed to checkpointing setup
+            # utils.apply_activation_checkpointing(self.transformer, checkpointing_type="full")
             utils.apply_activation_checkpointing(self.embedding, checkpointing_type="full")
 
         # Apply torch.compile
@@ -249,7 +314,8 @@ class InvTrainer(SFTTrainer):
             logger.info("Applying DDP to the model")
             parallel_backend.apply_ddp(self.transformer, parallel_backend.get_mesh())
         else:
-            # parallel_backend.prepare_model(self.transformer)
+            if self.args.joint:
+                parallel_backend.prepare_model(self.transformer)
             parallel_backend.prepare_model(self.embedding)
             logger.info(f"Prepare Model!!!")
 
@@ -261,7 +327,7 @@ class InvTrainer(SFTTrainer):
         # step. This is OK (see https://github.com/pytorch/pytorch/blob/2f40f789dafeaa62c4e4b90dbf4a900ff6da2ca4/torch/optim/sgd.py#L85-L99)
         # but can be optimized a bit by maybe creating a simple wrapper module encompassing the actual parameters that require
         # gradients. TODO(aryan): look into it in the future.
-        model_parts = [self.embedding]
+        model_parts = [self.embedding] if not self.args.joint else [self.embedding, self.transformer]
         self.state.num_trainable_parameters = sum(
             p.numel() for m in model_parts for p in m.parameters() if p.requires_grad
         )
@@ -348,7 +414,9 @@ class InvTrainer(SFTTrainer):
         )
         # timesteps_buffer = []
 
-        # self.transformer.train()
+        if self.args.joint:
+            self.transformer.train()
+        self.embedding.train()
         data_iterator = iter(self.dataloader)
 
         compute_posterior = False if self.args.enable_precomputation else (not self.args.precomputation_once)
@@ -411,14 +479,27 @@ class InvTrainer(SFTTrainer):
             condition_model_conditions = utils.align_device_and_dtype(condition_model_conditions, device, dtype)
             latent_model_conditions = utils.make_contiguous(latent_model_conditions)
             condition_model_conditions = utils.make_contiguous(condition_model_conditions)
-            logger.info(condition_model_conditions.keys())
+
+            # 2.5 Replace embeddings
+            # logger.info(condition_model_conditions.keys())
             # logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
             # convert mask from float to bool
             condition_model_conditions['special_mask'] = condition_model_conditions['special_mask'].to(torch.bool)
+            # logger.info(f"Embedding before replacement: {condition_model_conditions['encoder_hidden_states'].shape}, requires_grad: {condition_model_conditions['encoder_hidden_states'].requires_grad}")
+            for B in range(condition_model_conditions['encoder_hidden_states'].shape[0]):
+                for L in range(condition_model_conditions['encoder_hidden_states'].shape[1]):
+                    if condition_model_conditions['special_mask'][B, L]:
+                        # logger.info(f"Replacing embedding for batch {B}, token {L}")
+                        condition_model_conditions['encoder_hidden_states'][B] = \
+                            torch.cat([condition_model_conditions['encoder_hidden_states'][B, :L, :], 
+                                      self.embedding.embedding[0, :],
+                                      condition_model_conditions['encoder_hidden_states'][B, L + 1:, :]], dim=0)[:512] # TODO: max sequence length
+            # logger.info(f"Embedding after replacement: {condition_model_conditions['encoder_hidden_states'].shape}, requires_grad: {condition_model_conditions['encoder_hidden_states'].requires_grad}")
             # logger.info(f"mask dtype: {condition_model_conditions['special_mask']}, shape: {condition_model_conditions['special_mask'].shape}")
-            condition_model_conditions['encoder_hidden_states'][condition_model_conditions['special_mask'], :] = self.embedding.embedding
-            logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
+            # condition_model_conditions['encoder_hidden_states'][condition_model_conditions['special_mask'], :] = self.embedding.embedding
+            # logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
             condition_model_conditions.pop("special_mask", None)
+
             # 3. Forward pass
             sigmas = utils.prepare_sigmas(
                 scheduler=self.scheduler,
@@ -466,13 +547,19 @@ class InvTrainer(SFTTrainer):
                     if self.args.gradient_accumulation_steps > 1:
                         loss = loss / self.args.gradient_accumulation_steps
                     logger.info(f"loss requires_grad: {loss.requires_grad}, loss: {loss.item()}")
+                    # Regularization loss
+                    reg_loss = self.embedding.loss()
+                    if self.args.gradient_accumulation_steps > 1:
+                        reg_loss = reg_loss / self.args.gradient_accumulation_steps
+                    logger.info(f"reg_loss requires_grad: {reg_loss.requires_grad}, reg_loss: {reg_loss.item()}")
+                    # loss += 0.3 * reg_loss
                     loss.backward()
                     logger.info(f"Embedding grad norm: {self.embedding.embedding.grad.norm()}")
                 accumulated_loss += loss.detach().item()
                 requires_gradient_step = True
 
             # 5. Clip gradients
-            model_parts = [self.embedding]
+            model_parts = [self.embedding] if not self.args.joint else [self.embedding, self.transformer]
             grad_norm = utils.torch._clip_grad_norm_while_handling_failing_dtensor_cases(
                 [p for m in model_parts for p in m.parameters()],
                 self.args.max_grad_norm,
@@ -482,8 +569,6 @@ class InvTrainer(SFTTrainer):
 
             # 6. Step optimizer & log metrics
             logs = {}
-            # if train_state.step % 60 == 0:
-            #     self._save_embedding(train_state.step)
             
             if train_state.step % self.args.gradient_accumulation_steps == 0:
                 # TODO(aryan): revisit no_sync() for FSDP
@@ -494,7 +579,8 @@ class InvTrainer(SFTTrainer):
                     self.optimizer.zero_grad()
                 logger.info(f"embedding: {self.embedding.embedding.sum()}")
                 logger.info(f"embedding change: {(initial_embedding - self.embedding.embedding).norm()}")
-                logs["train/lr"] = self.lr_scheduler.get_last_lr()[0] if isinstance(self.lr_scheduler, dict) else self.lr_scheduler.get_last_lr()
+                logs["train/lr"] = self.lr_scheduler.get_last_lr()[0] if isinstance(self.lr_scheduler, dict) else self.lr_scheduler.get_last_lr()[0]
+                logs["train/reg_loss"] = reg_loss.detach().item() * self.args.gradient_accumulation_steps
                 if grad_norm is not None:
                     grad_norm = grad_norm if isinstance(grad_norm, float) else grad_norm.detach().item()
                 if (
@@ -544,18 +630,18 @@ class InvTrainer(SFTTrainer):
 
             # 7. Save checkpoint if required # TODO
             with self.tracker.timed("timing/checkpoint"):
-                if train_state.step % 1000 == 0:
+                if train_state.step % self.args.checkpointing_steps == 0:
                     self.checkpointer.save(
                         step=train_state.step, _device=device, _is_main_process=parallel_backend.is_main_process
                     )
                     self._save_embedding(train_state.step)
 
-            if train_state.step == 4000:
-                self._validate(step=train_state.step, final_validation=False)
-                exit(0)
-            # 8. Perform validation if required # TODO
-            # if train_state.step % self.args.validation_steps == 0:
+            # if train_state.step % 30 == 0:
             #     self._validate(step=train_state.step, final_validation=False)
+                # exit(0)
+            # 8. Perform validation if required # TODO
+            if train_state.step % self.args.validation_steps == 0:
+                self._validate(step=train_state.step, final_validation=False)
 
         # 9. Final checkpoint, validation & cleanup
         self.checkpointer.save(
@@ -619,9 +705,11 @@ class InvTrainer(SFTTrainer):
         # TODO(aryan): when running validation with FSDP, if the number of data points is not divisible by dp_shards, we
         # will hang indefinitely. Either pad the dataset or raise an error early on during initialization if the dataset
         # size is not divisible by dp_shards.
-        # self.transformer.eval()
+        if self.args.joint:
+            self.transformer.eval()
+            # self.transformer.requires_grad_(False)
         self.embedding.eval()
-        self.embedding.requires_grad_(False)
+        # self.embedding.requires_grad_(False)
         while True:
             validation_data = next(data_iterator, None)
             if validation_data is None:
@@ -721,5 +809,8 @@ class InvTrainer(SFTTrainer):
         parallel_backend.wait_for_everyone()
         if not final_validation:
             self._move_components_to_device()
-            self.embedding.requires_grad_(True)
+            # self.embedding.requires_grad_(True)
             self.embedding.train()
+            if self.args.joint:
+                # self.transformer.requires_grad_(True)
+                self.transformer.train()
