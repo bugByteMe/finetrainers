@@ -24,14 +24,14 @@ pipe = WanPipelineInv.from_pretrained(
 # Load the embedding from a file
 embedding_tensor = torch.Tensor(1, 1, 4096)
 embedding = EmbeddingWrap(embedding_tensor)
-safetensors.torch.load_model(embedding, "./demo/output-class/finetrainers_step_2000/model.safetensors")
+safetensors.torch.load_model(embedding, "./demo/output-overfit-1e-1-correct/finetrainers_step_2000/model.safetensors")
 # pipe.load_lora_weights("/home/jrguo/finetrainers/demo2/output/lora_weights/000500", adapter_name="wan-lora")
 # pipe.set_adapters(["wan-lora"], [0.75])
 
 seed = 52
 step = 3000
 generator = torch.Generator(device=pipe.transformer.device).manual_seed(seed)
-videos = pipe("A * dog running in the snow", negative_prompt="", num_videos_per_prompt=2, num_frames=13, generator=generator).frames
+videos = pipe("A * dog running in the snow", negative_prompt="", special_embedding=embedding.embedding, num_videos_per_prompt=2, num_frames=13, generator=generator).frames
 for j, video in enumerate(videos):
     output_path = f"./ti_step_{step}_{seed}_seed_{j}.mp4"
     print(f"Saving video {j} to {output_path}")

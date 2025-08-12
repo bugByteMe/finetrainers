@@ -60,7 +60,7 @@ class InvTrainer(SFTTrainer):
         super().__init__(args, model_specification)
         self.embedding = None # Special embedding to be trained
         self.unwrap_transformer = None
-        self.args.joint = True
+        self.args.joint = False
         logger.info(f"Joint training: {self.args.joint}")
         torch.serialization.add_safe_globals([TrainState])
     
@@ -76,6 +76,7 @@ class InvTrainer(SFTTrainer):
             )
         
     # Wrapper for prepare_conditions to handle the specific case of inverse training
+    # The actual computation of text encoder is delayed to the training step, since precomputation will lose gradients
     @torch.no_grad()
     def prepare_conditions(
         self,
@@ -90,9 +91,10 @@ class InvTrainer(SFTTrainer):
             "text_encoder": text_encoder,
             "caption": caption,
             "max_sequence_length": max_sequence_length,
+            # "special_embedding": self.embedding.embedding,
             **kwargs,
         }
-
+        print(f"Trainer - prepare_conditions: embedding {self.embedding.embedding.requires_grad}")
         temp_tokens = tokenizer(
             caption,
             padding="max_length",
@@ -101,13 +103,18 @@ class InvTrainer(SFTTrainer):
             add_special_tokens=True,
             return_tensors="pt",
         )
+        embeds = text_encoder.encoder.get_input_embeddings()(temp_tokens.input_ids.to(text_encoder.device)).clone().detach()
         special_mask = temp_tokens.input_ids[0] == 900
-        # Add batch dimension
+        # # Add batch dimension
         special_mask = special_mask.unsqueeze(0).to(dtype=torch.bool)
-        logger.info(f"{temp_tokens.input_ids.shape}, {special_mask.shape} {special_mask.to(dtype=torch.bfloat16).sum()}")
+        # logger.info(f"{temp_tokens.input_ids.shape}, {special_mask.shape} {special_mask.to(dtype=torch.bfloat16).sum()}")
         # logger.info(f"Special indices: {self.special_indices}, tokens: {temp_tokens.input_ids[0]}")
-        conditions = self.model_specification.prepare_conditions(**conditions)
+        # conditions = self.model_specification.prepare_conditions(**conditions)
+        conditions = {}
+        conditions['embeds'] = embeds.to(dtype=text_encoder.dtype, device=text_encoder.device)
         conditions['special_mask'] = special_mask
+        conditions['__drop__'] = temp_tokens.attention_mask.bool()
+        conditions['encoder_hidden_states'] = torch.randn(1)
         # logger.info(f"shape: {conditions['encoder_hidden_states'].shape}, dtype: {conditions['encoder_hidden_states'].dtype}")
         # conditions['encoder_hidden_states'][:, self.special_indices, :] = self.embedding.embedding
         # logger.info(f"Updated conditions with embedding: {conditions['encoder_hidden_states'].shape}")
@@ -371,6 +378,107 @@ class InvTrainer(SFTTrainer):
         torch.save(self.embedding.state_dict(), embedding_path)
         logger.info(f"Saved embedding to {embedding_path}")
 
+    def _prepare_data(
+        self,
+        preprocessor: Union[data.InMemoryDistributedDataPreprocessor, data.PrecomputedDistributedDataPreprocessor],
+        data_iterator,
+    ):
+        if not self.args.enable_precomputation:
+            if not self._are_condition_models_loaded:
+                logger.info(
+                    "Precomputation disabled. Loading in-memory data loaders. All components will be loaded on GPUs."
+                )
+                condition_components = self.model_specification.load_condition_models()
+                latent_components = self.model_specification.load_latent_models()
+                all_components = {**condition_components, **latent_components}
+                self._set_components(all_components)
+                self._move_components_to_device(list(all_components.values()))
+                utils._enable_vae_memory_optimizations(self.vae, self.args.enable_slicing, self.args.enable_tiling)
+                self._maybe_torch_compile()
+            else:
+                condition_components = {k: v for k in self._condition_component_names if (v := getattr(self, k, None))}
+                latent_components = {k: v for k in self._latent_component_names if (v := getattr(self, k, None))}
+
+            condition_iterator = preprocessor.consume(
+                "condition",
+                components=condition_components,
+                data_iterator=data_iterator,
+                generator=self.state.generator,
+                cache_samples=True,
+            )
+            latent_iterator = preprocessor.consume(
+                "latent",
+                components=latent_components,
+                data_iterator=data_iterator,
+                generator=self.state.generator,
+                use_cached_samples=True,
+                drop_samples=True,
+            )
+
+            self._are_condition_models_loaded = True
+        else:
+            logger.info("Precomputed condition & latent data exhausted. Loading & preprocessing new data.")
+
+            parallel_backend = self.state.parallel_backend
+            if parallel_backend.world_size == 1:
+                self._move_components_to_device([self.transformer], "cpu")
+                utils.free_memory()
+                utils.synchronize_device()
+                torch.cuda.reset_peak_memory_stats(parallel_backend.device)
+
+            consume_fn = preprocessor.consume_once if self.args.precomputation_once else preprocessor.consume
+
+            # Prepare condition iterators
+            condition_components, component_names, component_modules = {}, [], []
+            if not self.args.precomputation_reuse:
+                condition_components = self.model_specification.load_condition_models()
+                component_names = list(condition_components.keys())
+                component_modules = list(condition_components.values())
+                self._set_components(condition_components)
+                self._move_components_to_device(component_modules)
+                self._maybe_torch_compile()
+            condition_iterator = consume_fn(
+                "condition",
+                components=condition_components,
+                data_iterator=data_iterator,
+                generator=self.state.generator,
+                cache_samples=True,
+            )
+            # pop text encoder from the condition components
+            if "text_encoder" in condition_components:
+                component_modules.remove(condition_components["text_encoder"])
+                condition_components.pop("text_encoder")
+                component_names.remove("text_encoder")
+                
+            self._delete_components(component_names)
+            del condition_components, component_names, component_modules
+
+            # Prepare latent iterators
+            latent_components, component_names, component_modules = {}, [], []
+            if not self.args.precomputation_reuse:
+                latent_components = self.model_specification.load_latent_models()
+                utils._enable_vae_memory_optimizations(self.vae, self.args.enable_slicing, self.args.enable_tiling)
+                component_names = list(latent_components.keys())
+                component_modules = list(latent_components.values())
+                self._set_components(latent_components)
+                self._move_components_to_device(component_modules)
+                self._maybe_torch_compile()
+            latent_iterator = consume_fn(
+                "latent",
+                components=latent_components,
+                data_iterator=data_iterator,
+                generator=self.state.generator,
+                use_cached_samples=True,
+                drop_samples=True,
+            )
+            self._delete_components(component_names)
+            del latent_components, component_names, component_modules
+
+            if parallel_backend.world_size == 1:
+                self._move_components_to_device([self.transformer])
+
+        return condition_iterator, latent_iterator
+    
     def _train(self) -> None:
         logger.info("Starting training")
 
@@ -484,22 +592,25 @@ class InvTrainer(SFTTrainer):
             # logger.info(condition_model_conditions.keys())
             # logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
             # convert mask from float to bool
-            condition_model_conditions['special_mask'] = condition_model_conditions['special_mask'].to(torch.bool)
+            # condition_model_conditions['special_mask'] = condition_model_conditions['special_mask'].to(torch.bool)
             # logger.info(f"Embedding before replacement: {condition_model_conditions['encoder_hidden_states'].shape}, requires_grad: {condition_model_conditions['encoder_hidden_states'].requires_grad}")
-            for B in range(condition_model_conditions['encoder_hidden_states'].shape[0]):
-                for L in range(condition_model_conditions['encoder_hidden_states'].shape[1]):
-                    if condition_model_conditions['special_mask'][B, L]:
-                        # logger.info(f"Replacing embedding for batch {B}, token {L}")
-                        condition_model_conditions['encoder_hidden_states'][B] = \
-                            torch.cat([condition_model_conditions['encoder_hidden_states'][B, :L, :], 
-                                      self.embedding.embedding[0, :],
-                                      condition_model_conditions['encoder_hidden_states'][B, L + 1:, :]], dim=0)[:512] # TODO: max sequence length
+            # for B in range(condition_model_conditions['encoder_hidden_states'].shape[0]):
+            #     for L in range(condition_model_conditions['encoder_hidden_states'].shape[1]):
+            #         if condition_model_conditions['special_mask'][B, L]:
+            #             # logger.info(f"Replacing embedding for batch {B}, token {L}")
+            #             condition_model_conditions['encoder_hidden_states'][B] = \
+            #                 torch.cat([condition_model_conditions['encoder_hidden_states'][B, :L, :], 
+            #                           self.embedding.embedding[0, :],
+            #                           condition_model_conditions['encoder_hidden_states'][B, L + 1:, :]], dim=0)[:512] # TODO: max sequence length
             # logger.info(f"Embedding after replacement: {condition_model_conditions['encoder_hidden_states'].shape}, requires_grad: {condition_model_conditions['encoder_hidden_states'].requires_grad}")
             # logger.info(f"mask dtype: {condition_model_conditions['special_mask']}, shape: {condition_model_conditions['special_mask'].shape}")
             # condition_model_conditions['encoder_hidden_states'][condition_model_conditions['special_mask'], :] = self.embedding.embedding
-            # logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
+            condition_model_conditions['embeds'][condition_model_conditions['special_mask'].to(torch.bool), :] = self.embedding.embedding
+            condition_model_conditions['encoder_hidden_states'] = self.text_encoder(attention_mask=condition_model_conditions['__drop__'], inputs_embeds=condition_model_conditions['embeds'])[0]
+            logger.info(f"{condition_model_conditions['encoder_hidden_states'].shape}, {condition_model_conditions['encoder_hidden_states'].requires_grad}")
             condition_model_conditions.pop("special_mask", None)
-
+            condition_model_conditions.pop("embeds", None)
+            condition_model_conditions.pop("__drop__", None)
             # 3. Forward pass
             sigmas = utils.prepare_sigmas(
                 scheduler=self.scheduler,
@@ -640,8 +751,8 @@ class InvTrainer(SFTTrainer):
             #     self._validate(step=train_state.step, final_validation=False)
                 # exit(0)
             # 8. Perform validation if required # TODO
-            if train_state.step % self.args.validation_steps == 0:
-                self._validate(step=train_state.step, final_validation=False)
+            # if train_state.step % self.args.validation_steps == 0:
+            #     self._validate(step=train_state.step, final_validation=False)
 
         # 9. Final checkpoint, validation & cleanup
         self.checkpointer.save(

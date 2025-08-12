@@ -102,20 +102,26 @@ class WanPipelineInv(WanPipeline):
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
         special_mask = text_input_ids[0] == 900
-        prompt_embeds = self.text_encoder(text_input_ids.to(device), mask.to(device)).last_hidden_state
-        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        embeds = self.text_encoder.encoder.get_input_embeddings()(text_input_ids.to(device))
         if special_embedding is not None:
-            special_embedding = special_embedding.to(device, dtype=dtype)
-            for B in range(prompt_embeds.shape[0]):
-                for L in range(prompt_embeds.shape[1]):
-                    if special_mask[L]:
-                        # logger.info(f"Replacing embedding for batch {B}, token {L}")
-                        prompt_embeds[B] = \
-                            torch.cat([prompt_embeds[B, :L, :], 
-                                      special_embedding[0, :],
-                                      prompt_embeds[B, L + 1:, :]], dim=0)[:max_sequence_length]
+            print("\n\n Using special embedding \n\n")
+            special_mask = text_input_ids[0] == 900
+            special_mask = special_mask.unsqueeze(0).to(dtype=torch.bool).to(device)
+            embeds[special_mask, :] = special_embedding.to(embeds)
+        prompt_embeds = self.text_encoder(attention_mask=mask.to(device), inputs_embeds=embeds).last_hidden_state
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        # if special_embedding is not None:
+        #     special_embedding = special_embedding.to(device, dtype=dtype)
+        #     for B in range(prompt_embeds.shape[0]):
+        #         for L in range(prompt_embeds.shape[1]):
+        #             if special_mask[L]:
+        #                 # logger.info(f"Replacing embedding for batch {B}, token {L}")
+        #                 prompt_embeds[B] = \
+        #                     torch.cat([prompt_embeds[B, :L, :], 
+        #                               special_embedding[0, :],
+        #                               prompt_embeds[B, L + 1:, :]], dim=0)[:max_sequence_length]
                         
-            # prompt_embeds[:, special_mask, :] = special_embedding
+        #     # prompt_embeds[:, special_mask, :] = special_embedding
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
             [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
@@ -494,6 +500,32 @@ class WanModelSpecificationInv(WanModelSpecification):
             cache_dir=cache_dir,
             **kwargs,
         )
+    
+    def load_condition_models(self) -> Dict[str, torch.nn.Module]:
+        common_kwargs = {"revision": self.revision, "cache_dir": self.cache_dir}
+
+        if self.tokenizer_id is not None:
+            tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id, **common_kwargs)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.pretrained_model_name_or_path, subfolder="tokenizer", **common_kwargs
+            )
+
+        if self.text_encoder_id is not None:
+            text_encoder = AutoModel.from_pretrained(
+                self.text_encoder_id, torch_dtype=self.text_encoder_dtype, **common_kwargs
+            )
+        else:
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                self.pretrained_model_name_or_path,
+                subfolder="text_encoder",
+                torch_dtype=self.text_encoder_dtype,
+                **common_kwargs,
+            )
+            from finetrainers import utils
+            utils.set_requires_grad(text_encoder, True)
+
+        return {"tokenizer": tokenizer, "text_encoder": text_encoder}
     
     def load_pipeline(
         self,

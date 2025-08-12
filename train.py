@@ -35,7 +35,7 @@ def main():
         if training_type == TrainingType.LORA:
             training_cls = SFTLowRankConfig
         elif training_type == TrainingType.FULL_FINETUNE or training_type == "inv":
-            training_cls = SFTFullRankConfig
+            training_cls = SFTLowRankConfig
         elif training_type == TrainingType.CONTROL_LORA:
             training_cls = ControlLowRankConfig
         elif training_type == TrainingType.CONTROL_FULL_FINETUNE:
